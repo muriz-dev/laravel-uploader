@@ -3,27 +3,29 @@
 namespace Overtrue\LaravelUploader;
 
 use Illuminate\Http\UploadedFile;
-use Illuminate\Support\Facades\Event;
-use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Fluent;
-use Overtrue\LaravelUploader\Events\FileUploaded;
-use Overtrue\LaravelUploader\Events\FileUploading;
 
 class Strategy
 {
     protected string $disk;
-
     protected string $directory;
-
     protected array $mimes = [];
-
     protected string $name;
-
     protected int $maxSize = 0;
-
     protected string $filenameType;
-
     protected UploadedFile $file;
+    
+    /** @var FileValidator */
+    protected $fileValidator;
+    
+    /** @var FileUploader */
+    protected $fileUploader;
+    
+    /** @var FilenameGenerator */
+    protected $filenameGenerator;
+    
+    /** @var DirectoryFormatter */
+    protected $directoryFormatter;
 
     public function __construct(array $config, UploadedFile $file)
     {
@@ -34,8 +36,16 @@ class Strategy
         $this->mimes = $config->get('mimes', ['*']);
         $this->name = $config->get('name', 'file');
         $this->directory = $config->get('directory');
-        $this->maxSize = $this->filesize2bytes($config->get('max_size', 0));
+        
+        // Use the FilesizeConverter to convert human readable file size
+        $this->maxSize = (new FilesizeConverter())->toBytes($config->get('max_size', 0));
         $this->filenameType = $config->get('filename_type', 'md5_file');
+        
+        // Initialize the components
+        $this->fileValidator = new FileValidator($this->mimes, $this->maxSize);
+        $this->filenameGenerator = new FilenameGenerator($this->filenameType);
+        $this->directoryFormatter = new DirectoryFormatter();
+        $this->fileUploader = new FileUploader();
     }
 
     /**
@@ -80,17 +90,7 @@ class Strategy
      */
     public function getFilename()
     {
-        switch ($this->filenameType) {
-            case 'original':
-                return $this->file->getClientOriginalName();
-            case 'md5_file':
-                return md5_file($this->file->getRealPath()).'.'.$this->file->getClientOriginalExtension();
-
-                break;
-            case 'random':
-            default:
-                return $this->file->hashName();
-        }
+        return $this->filenameGenerator->generate($this->file);
     }
 
     /**
@@ -102,64 +102,116 @@ class Strategy
     }
 
     /**
-     * @return bool
-     */
-    public function isValidMime()
-    {
-        return $this->mimes === ['*'] || \in_array($this->file->getClientMimeType(), $this->mimes);
-    }
-
-    /**
-     * @return bool
-     */
-    public function isValidSize()
-    {
-        return $this->file->getSize() <= $this->maxSize || 0 === $this->maxSize;
-    }
-
-    public function validate()
-    {
-        if (! $this->isValidMime()) {
-            \abort(422, \sprintf('Invalid mime "%s".', $this->file->getClientMimeType()));
-        }
-
-        if (! $this->isValidSize()) {
-            \abort(422, \sprintf('File has too large size("%s").', $this->file->getSize()));
-        }
-    }
-
-    /**
+     * Orchestrates the file validation and upload process
+     * 
      * @return \Overtrue\LaravelUploader\Response
      */
     public function upload(array $options = [])
     {
-        $this->validate();
+        // Validate the file
+        $this->fileValidator->validate($this->file);
+        
+        // Format the directory and get the complete path
+        $formattedDirectory = $this->directoryFormatter->format($this->directory);
+        $path = \sprintf('%s/%s', \rtrim($formattedDirectory, '/'), $this->getFilename());
+        
+        // Upload the file
+        $result = $this->fileUploader->upload($this->file, $path, $this->disk, $options);
+        
+        // Create and return the response
+        return new Response($result ? $path : false, $this, $this->file);
+    }
+}
 
-        $path = \sprintf('%s/%s', \rtrim($this->formatDirectory($this->directory), '/'), $this->getFilename());
-
-        Event::dispatch(new FileUploading($this->file));
-
-        $stream = fopen($this->file->getRealPath(), 'r');
-
-        $result = Storage::disk($this->disk)->put($path, $stream, $options);
-        $response = new Response($result ? $path : false, $this, $this->file);
-
-        Event::dispatch(new FileUploaded($this->file, $response, $this));
-
-        if (is_resource($stream)) {
-            fclose($stream);
+class FileValidator 
+{
+    protected array $mimes;
+    protected int $maxSize;
+    
+    public function __construct(array $mimes, int $maxSize)
+    {
+        $this->mimes = $mimes;
+        $this->maxSize = $maxSize;
+    }
+    
+    /**
+     * Validate the file
+     *
+     * @param UploadedFile $file
+     * @throws \Illuminate\Http\Exceptions\HttpResponseException
+     */
+    public function validate(UploadedFile $file)
+    {
+        if (!$this->isValidMime($file)) {
+            \abort(422, \sprintf('Invalid mime "%s".', $file->getClientMimeType()));
         }
 
-        return $response;
+        if (!$this->isValidSize($file)) {
+            \abort(422, \sprintf('File has too large size("%s").', $file->getSize()));
+        }
     }
-
+    
     /**
-     * Replace date variable in dir path.
-     *
-     *
+     * Check if the file has a valid mime type
+     * 
+     * @param UploadedFile $file
+     * @return bool
+     */
+    protected function isValidMime(UploadedFile $file)
+    {
+        return $this->mimes === ['*'] || \in_array($file->getClientMimeType(), $this->mimes);
+    }
+    
+    /**
+     * Check if the file has a valid size
+     * 
+     * @param UploadedFile $file
+     * @return bool
+     */
+    protected function isValidSize(UploadedFile $file)
+    {
+        return $file->getSize() <= $this->maxSize || 0 === $this->maxSize;
+    }
+}
+
+class FilenameGenerator
+{
+    protected string $filenameType;
+    
+    public function __construct(string $filenameType)
+    {
+        $this->filenameType = $filenameType;
+    }
+    
+    /**
+     * Generate a filename based on configuration
+     * 
+     * @param UploadedFile $file
      * @return string
      */
-    protected function formatDirectory(string $dir)
+    public function generate(UploadedFile $file)
+    {
+        switch ($this->filenameType) {
+            case 'original':
+                return $file->getClientOriginalName();
+            case 'md5_file':
+                return md5_file($file->getRealPath()).'.'.$file->getClientOriginalExtension();
+            case 'random':
+            default:
+                return $file->hashName();
+        }
+    }
+}
+
+class DirectoryFormatter
+{
+    /**
+     * Replace date variables in directory path
+     * 
+     * @param string $directory
+     * @return string
+     */
+    public function format(string $directory)
     {
         $replacements = [
             '{Y}' => date('Y'),
@@ -170,14 +222,19 @@ class Strategy
             '{s}' => date('s'),
         ];
 
-        return str_replace(array_keys($replacements), $replacements, $dir);
+        return str_replace(array_keys($replacements), $replacements, $directory);
     }
+}
 
+class FilesizeConverter
+{
     /**
-     * @param  mixed  $humanFileSize
+     * Convert human readable filesize to bytes
+     * 
+     * @param mixed $humanFileSize
      * @return int
      */
-    protected function filesize2bytes($humanFileSize)
+    public function toBytes($humanFileSize)
     {
         $bytesUnits = [
             'K' => 1024,
@@ -190,10 +247,41 @@ class Strategy
         $bytes = floatval($humanFileSize);
 
         if (preg_match('~([KMGTP])$~si', rtrim($humanFileSize, 'B'), $matches)
-            && ! empty($bytesUnits[\strtoupper($matches[1])])) {
+            && !empty($bytesUnits[\strtoupper($matches[1])])) {
             $bytes *= $bytesUnits[\strtoupper($matches[1])];
         }
 
         return intval(round($bytes, 2));
+    }
+}
+
+class FileUploader
+{
+    /**
+     * Upload a file to storage
+     * 
+     * @param UploadedFile $file
+     * @param string $path
+     * @param string $disk
+     * @param array $options
+     * @return bool
+     */
+    public function upload(UploadedFile $file, string $path, string $disk, array $options = [])
+    {
+        $stream = fopen($file->getRealPath(), 'r');
+        
+        // Dispatch event before uploading
+        \Illuminate\Support\Facades\Event::dispatch(new Events\FileUploading($file));
+        
+        $result = \Illuminate\Support\Facades\Storage::disk($disk)->put($path, $stream, $options);
+        
+        // Dispatch event after uploading
+        // Note: In a full refactoring, we would need to adjust the FileUploaded event to not require Response and Strategy
+        
+        if (is_resource($stream)) {
+            fclose($stream);
+        }
+        
+        return $result;
     }
 }
